@@ -55,7 +55,7 @@ class UpSmartGarageCover(UpSmartGarageEntity, CoverEntity):
 
     @property
     def supported_features(self) -> CoverEntityFeature:
-        return CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.STOP
+        return CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.STOP | CoverEntityFeature.SET_POSITION
 
     @property
     def current_cover_position(self) -> int | None:
@@ -162,6 +162,36 @@ class UpSmartGarageCover(UpSmartGarageEntity, CoverEntity):
             await self.async_stop_cover()
 
         await self._do_transition_state(DoorState.CLOSED)
+
+    async def async_set_cover_position(self, **kwargs) -> None:
+        target = kwargs.get(ATTR_POSITION)
+        if target is None:
+            return
+
+        current = self.current_cover_position or 0
+
+        if target == current:
+            return  # nothing to do
+
+        direction_opening = target > current
+        delta_percent = abs(target - current)
+
+        # full travel time for a complete run, in the chosen direction
+        full_time = self._garage_state.controller.open_to_close_delta if direction_opening \
+            else self._garage_state.controller.close_to_open_delta
+
+        wait_time = full_time * (delta_percent / 100)
+
+        # start moving (same pulse used by open/close)
+        if direction_opening:
+            await self.async_open_cover()
+        else:
+            await self.async_close_cover()
+
+        await asyncio.sleep(wait_time)
+
+        # stop mid-travel with a second pulse
+        await self.async_stop_cover()
 
     async def _do_transition_state(self, state: DoorState) -> None:
         """Generic open-to-close / close-to-open transition function"""
