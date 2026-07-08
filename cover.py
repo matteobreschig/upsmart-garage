@@ -8,7 +8,7 @@ import datetime
 
 import asyncio
 from homeassistant.core import HomeAssistant, Event, callback, CALLBACK_TYPE
-from homeassistant.components.cover import CoverEntity, CoverDeviceClass, CoverEntityFeature
+from homeassistant.components.cover import CoverEntity, CoverDeviceClass, CoverEntityFeature, ATTR_POSITION
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event, async_call_later
@@ -48,6 +48,7 @@ class UpSmartGarageCover(UpSmartGarageEntity, CoverEntity):
     _sensor_closed: bool | None = None  # if we have sensor for fully closed it will signify its state
     _sensor_opened: bool | None = None  # if we have sensor for fully open it will signify its state
     _toggle_state: bool | None = None  # toggle button state used to control the open/close/stop action of the door
+    _last_direction_before_stop: DoorState | None = None  # remembers which way it was heading when stopped mid-transition
 
     def __init__(self, hass: HomeAssistant, state: GarageDoorState):
         super().__init__(hass, state, "door")
@@ -135,35 +136,6 @@ class UpSmartGarageCover(UpSmartGarageEntity, CoverEntity):
         # probably grossly inaccurate and prone to failures. This is because typical door motion isn't linear and the
         # time is only semi-predictable when starting from the bottom or top (i.e. time-to-close when open at 50% isn't
         # equal to time-to-close/2)
-        raise NotImplementedError()
-
-    async def async_open_cover(self, **kwargs: Any) -> None:
-        """Performs fully closed to open transition"""
-        _LOGGER.debug(f"Open requested for {self.unique_id}")
-        if self.is_opening:
-            _LOGGER.warning(f"Attempted to open {self.unique_id} when it is already opening")
-            return
-
-        if self.is_closing:
-            _LOGGER.debug(f"{self.unique_id} is closing - stopping first")
-            await self.async_stop_cover()
-
-        await self._do_transition_state(DoorState.OPENED)
-
-    async def async_close_cover(self, **kwargs: Any) -> None:
-        """Performs open/partially-open to close transition"""
-        _LOGGER.debug(f"Close requested for {self.unique_id}")
-        if self.is_closing:
-            _LOGGER.warning(f"Attempted to close {self.unique_id} when it is already closing")
-            return
-
-        if self.is_opening:
-            _LOGGER.debug(f"{self.unique_id} is opening - stopping first")
-            await self.async_stop_cover()
-
-        await self._do_transition_state(DoorState.CLOSED)
-
-    async def async_set_cover_position(self, **kwargs) -> None:
         target = kwargs.get(ATTR_POSITION)
         if target is None:
             return
@@ -193,7 +165,33 @@ class UpSmartGarageCover(UpSmartGarageEntity, CoverEntity):
         # stop mid-travel with a second pulse
         await self.async_stop_cover()
 
-    async def _do_transition_state(self, state: DoorState) -> None:
+    async def async_open_cover(self, **kwargs: Any) -> None:
+        """Performs fully closed to open transition"""
+        _LOGGER.debug(f"Open requested for {self.unique_id}")
+        if self.is_opening:
+            _LOGGER.warning(f"Attempted to open {self.unique_id} when it is already opening")
+            return
+
+        if self.is_closing:
+            _LOGGER.debug(f"{self.unique_id} is closing - stopping first")
+            await self.async_stop_cover()
+
+        await self._do_transition_state(DoorState.OPENED, resume=(self._last_direction_before_stop == DoorState.OPENED))
+
+    async def async_close_cover(self, **kwargs: Any) -> None:
+        """Performs open/partially-open to close transition"""
+        _LOGGER.debug(f"Close requested for {self.unique_id}")
+        if self.is_closing:
+            _LOGGER.warning(f"Attempted to close {self.unique_id} when it is already closing")
+            return
+
+        if self.is_opening:
+            _LOGGER.debug(f"{self.unique_id} is opening - stopping first")
+            await self.async_stop_cover()
+
+        await self._do_transition_state(DoorState.CLOSED, resume=(self._last_direction_before_stop == DoorState.CLOSED))
+
+    async def _do_transition_state(self, state: DoorState, resume: bool = False) -> None:
         """Generic open-to-close / close-to-open transition function"""
         # Attempt transition first, to make sure the intended action conforms to the state machine
         try:
@@ -210,13 +208,29 @@ class UpSmartGarageCover(UpSmartGarageEntity, CoverEntity):
         _LOGGER.debug(f"{self.unique_id} will be transitioning " 
                       f"{self._garage_state.last_state} => {state.name} in max {max_expected_time}s")
 
-        await self._pulse_toggle()
+        if resume:
+            # resuming in the same direction it was stopped in: some motor controllers need a triple pulse
+            # to tell "continue in this direction" apart from "reverse direction" (mirrors old ESPHome logic)
+            _LOGGER.debug(f"{self.unique_id} resuming same direction after stop - triple pulse")
+            await self._pulse_toggle()
+            await asyncio.sleep(1)
+            await self._pulse_toggle()
+            await asyncio.sleep(1)
+            await self._pulse_toggle()
+        else:
+            await self._pulse_toggle()
+
+        self._last_direction_before_stop = None  # consumed, whichever branch we took
         self.async_write_ha_state()
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
         if not self._garage_state.is_in_motion():
             _LOGGER.warning(f"{self.unique_id} not in motion - not stopping")
             return
+
+        # remember which way it was heading, so a resume in the same direction
+        # can use a triple pulse instead of a single one (mirrors old ESPHome logic)
+        self._last_direction_before_stop = self._garage_state.target_state
 
         # Attempt transition first, to make sure the intended action conforms to the state machine
         _LOGGER.debug(f"{self.unique_id} stopping on request")
